@@ -1,17 +1,29 @@
 import base64
 import io
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import face_recognition
 import numpy as np
 from PIL import Image
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Boletix Face Compare Service")
+face_app = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global face_app
+    logger.info("Loading InsightFace model...")
+    from insightface.app import FaceAnalysis
+    face_app = FaceAnalysis(name="buffalo_sc", providers=["CPUExecutionProvider"])
+    face_app.prepare(ctx_id=0, det_size=(320, 320))
+    logger.info("Model ready.")
+    yield
+
+app = FastAPI(title="Boletix Face Compare Service", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,62 +34,60 @@ app.add_middleware(
 
 
 class CompareRequest(BaseModel):
-    image1_base64: str  # Cédula image
-    image2_base64: str  # Selfie image
+    image1_base64: str
+    image2_base64: str
 
 
-def b64_to_rgb(b64: str) -> np.ndarray:
+def b64_to_bgr(b64: str) -> np.ndarray:
     if "," in b64:
         b64 = b64.split(",")[1]
-    raw = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    # Limit size to speed up processing
-    img.thumbnail((800, 800))
-    return np.array(img)
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    img.thumbnail((640, 640))
+    arr = np.array(img)
+    return arr[:, :, ::-1].copy()  # RGB to BGR for InsightFace
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model_loaded": face_app is not None}
 
 
 @app.post("/compare")
 def compare(req: CompareRequest):
+    if face_app is None:
+        raise HTTPException(503, {"error": "model_loading", "message": "Model not ready yet"})
+
     try:
-        img1 = b64_to_rgb(req.image1_base64)
-        img2 = b64_to_rgb(req.image2_base64)
+        img1 = b64_to_bgr(req.image1_base64)
+        img2 = b64_to_bgr(req.image2_base64)
     except Exception as e:
         raise HTTPException(400, {"error": "invalid_image", "message": str(e)})
 
-    # Detect + encode faces (HOG model is faster on CPU than CNN)
-    enc1 = face_recognition.face_encodings(img1, model="hog")
-    enc2 = face_recognition.face_encodings(img2, model="hog")
+    faces1 = face_app.get(img1)
+    faces2 = face_app.get(img2)
 
-    if not enc1:
+    if not faces1:
         raise HTTPException(422, {
             "error": "no_face_cedula",
             "message": "No se detectó un rostro en la foto de la Cédula."
         })
-    if not enc2:
+    if not faces2:
         raise HTTPException(422, {
             "error": "no_face_selfie",
             "message": "No se detectó un rostro en el selfie."
         })
 
-    # face_recognition distance: 0.0 = identical, 0.6 = different person threshold
-    distance = float(face_recognition.face_distance([enc1[0]], enc2[0])[0])
+    emb1 = faces1[0].normed_embedding
+    emb2 = faces2[0].normed_embedding
 
-    # Convert distance to 0-100 similarity score
-    # distance 0.0 → 100%, distance 0.6 → 0%
-    similarity = round(max(0.0, min(100.0, (1.0 - distance / 0.6) * 100)), 1)
+    cosine_sim = float(np.dot(emb1, emb2))
+    similarity = round(max(0.0, min(100.0, cosine_sim * 100)), 1)
+    verified = cosine_sim > 0.3
 
-    # Stricter threshold than default 0.6 — reduces false positives
-    verified = distance < 0.45
-
-    logger.info(f"compare: distance={distance:.4f} similarity={similarity} verified={verified}")
+    logger.info(f"compare: cosine={cosine_sim:.4f} similarity={similarity} verified={verified}")
 
     return {
         "verified": verified,
         "similarity": similarity,
-        "distance": round(distance, 4),
+        "distance": round(1 - cosine_sim, 4),
     }
