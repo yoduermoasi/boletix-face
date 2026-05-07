@@ -47,6 +47,29 @@ def b64_to_bgr(b64: str) -> np.ndarray:
     return arr[:, :, ::-1].copy()  # RGB to BGR for InsightFace
 
 
+def enhance_contrast(img_bgr: np.ndarray) -> np.ndarray:
+    """Histogram equalization to help detection on dark/low-contrast images."""
+    import cv2
+    yuv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YUV)
+    yuv[:, :, 0] = cv2.equalizeHist(yuv[:, :, 0])
+    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+
+def detect_cedula_faces(img_bgr: np.ndarray):
+    """Try harder to detect face on ID card — small face within larger image."""
+    faces = face_app.get(img_bgr)
+    if faces:
+        return faces
+    # Retry with contrast enhancement for dark/low-quality images
+    faces = face_app.get(enhance_contrast(img_bgr))
+    if faces:
+        return faces
+    # Retry on upper half of card (face is usually there on Colombian IDs)
+    h = img_bgr.shape[0]
+    faces = face_app.get(img_bgr[:h // 2, :])
+    return faces
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": face_app is not None}
@@ -63,7 +86,7 @@ def compare(req: CompareRequest):
     except Exception as e:
         raise HTTPException(400, {"error": "invalid_image", "message": str(e)})
 
-    faces1 = face_app.get(img1)
+    faces1 = detect_cedula_faces(img1)
     faces2 = face_app.get(img2)
 
     if not faces1:
